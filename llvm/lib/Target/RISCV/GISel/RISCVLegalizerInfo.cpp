@@ -451,7 +451,8 @@ RISCVLegalizerInfo::RISCVLegalizerInfo(const RISCVSubtarget &ST)
       .widenScalarToNextPow2(0)
       .clampScalar(0, s32, sXLen);
 
-  getActionDefinitionsBuilder({G_GLOBAL_VALUE, G_JUMP_TABLE, G_CONSTANT_POOL})
+  getActionDefinitionsBuilder(
+      {G_GLOBAL_VALUE, G_JUMP_TABLE, G_CONSTANT_POOL, G_BLOCK_ADDR})
       .legalFor({p0});
 
   if (ST.hasStdExtZmmul()) {

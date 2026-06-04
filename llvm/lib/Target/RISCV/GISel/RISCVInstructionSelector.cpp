@@ -1344,6 +1344,7 @@ bool RISCVInstructionSelector::select(MachineInstr &MI) {
   }
   case TargetOpcode::G_JUMP_TABLE:
   case TargetOpcode::G_CONSTANT_POOL:
+  case TargetOpcode::G_BLOCK_ADDR:
     return selectAddr(MI);
   case TargetOpcode::G_BRCOND: {
     Register LHS, RHS;
@@ -1708,7 +1709,8 @@ bool RISCVInstructionSelector::selectAddr(MachineInstr &MI, bool IsLocal,
                                           bool IsExternWeak) const {
   assert((MI.getOpcode() == TargetOpcode::G_GLOBAL_VALUE ||
           MI.getOpcode() == TargetOpcode::G_JUMP_TABLE ||
-          MI.getOpcode() == TargetOpcode::G_CONSTANT_POOL) &&
+          MI.getOpcode() == TargetOpcode::G_CONSTANT_POOL ||
+          MI.getOpcode() == TargetOpcode::G_BLOCK_ADDR) &&
          "Unexpected opcode");
 
   const MachineOperand &DispMO = MI.getOperand(1);
