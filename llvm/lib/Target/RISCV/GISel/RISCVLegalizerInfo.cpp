@@ -19,6 +19,7 @@
 #include "llvm/CodeGen/GlobalISel/LegalizerHelper.h"
 #include "llvm/CodeGen/GlobalISel/MachineIRBuilder.h"
 #include "llvm/CodeGen/MachineConstantPool.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
 #include "llvm/CodeGen/MachineJumpTableInfo.h"
 #include "llvm/CodeGen/MachineMemOperand.h"
 #include "llvm/CodeGen/MachineOperand.h"
@@ -824,6 +825,67 @@ bool RISCVLegalizerInfo::legalizeIntrinsic(LegalizerHelper &Helper,
         MachinePointerInfo(), MachineMemOperand::MOStore, PtrTy, Alignment);
     MIRBuilder.buildStore(Tmp, DstLst, *StoreMMO);
 
+    MI.eraseFromParent();
+    return true;
+  }
+  case Intrinsic::frameaddress:
+  case Intrinsic::returnaddress: {
+    // Lower like RISCVTargetLowering::lowerFRAMEADDR / lowerRETURNADDR.
+    // returnaddress at depth 0 reads the live-in return address register.
+    // Otherwise walk the frame pointer chain Depth times; frameaddress returns
+    // that frame, returnaddress loads the address saved one XLen below it.
+    bool IsReturn = IntrinsicID == Intrinsic::returnaddress;
+    MachineIRBuilder &MIRBuilder = Helper.MIRBuilder;
+    MachineRegisterInfo &MRI = *MIRBuilder.getMRI();
+    MachineFunction &MF = *MI.getMF();
+    MachineFrameInfo &MFI = MF.getFrameInfo();
+    const RISCVRegisterInfo *RI = STI.getRegisterInfo();
+    MachineBasicBlock &EntryMBB = MF.front();
+
+    Register Dst = MI.getOperand(0).getReg();
+    LLT PtrTy = MRI.getType(Dst);
+    uint64_t Depth = MI.getOperand(2).getImm();
+    int64_t XLenInBytes = XLen / 8;
+
+    // Copy a callee-entry physreg into a fresh vreg, placing the COPY at the top
+    // of the entry block so it captures the value before any clobber.
+    auto copyLiveIn = [&](Register PhysReg) {
+      EntryMBB.addLiveIn(PhysReg);
+      Register Vreg = MRI.createGenericVirtualRegister(PtrTy);
+      MachineBasicBlock &SaveMBB = MIRBuilder.getMBB();
+      MachineBasicBlock::iterator SaveIt = MIRBuilder.getInsertPt();
+      MIRBuilder.setInsertPt(EntryMBB, EntryMBB.begin());
+      MIRBuilder.buildCopy(Vreg, PhysReg);
+      MIRBuilder.setInsertPt(SaveMBB, SaveIt);
+      return Vreg;
+    };
+    auto loadFrom = [&](const DstOp &Res, Register Base, int64_t Off) {
+      auto Offset = MIRBuilder.buildConstant(sXLen, Off);
+      auto Addr = MIRBuilder.buildPtrAdd(PtrTy, Base, Offset);
+      MachineMemOperand *MMO = MF.getMachineMemOperand(
+          MachinePointerInfo(), MachineMemOperand::MOLoad, PtrTy,
+          Align(XLenInBytes));
+      return MIRBuilder.buildLoad(Res, Addr, *MMO);
+    };
+
+    if (IsReturn && Depth == 0) {
+      MFI.setReturnAddressIsTaken(true);
+      MIRBuilder.buildCopy(Dst, copyLiveIn(RISCV::X1));
+      MI.eraseFromParent();
+      return true;
+    }
+
+    MFI.setFrameAddressIsTaken(true);
+    Register FrameAddr = copyLiveIn(RI->getFrameRegister(MF));
+    for (uint64_t I = 0; I < Depth; ++I)
+      FrameAddr = loadFrom(PtrTy, FrameAddr, -2 * XLenInBytes).getReg(0);
+
+    if (!IsReturn) {
+      MIRBuilder.buildCopy(Dst, FrameAddr);
+    } else {
+      MFI.setReturnAddressIsTaken(true);
+      loadFrom(Dst, FrameAddr, -XLenInBytes);
+    }
     MI.eraseFromParent();
     return true;
   }
