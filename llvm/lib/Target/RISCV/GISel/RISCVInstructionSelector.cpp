@@ -85,6 +85,7 @@ private:
   bool selectAddr(MachineInstr &MI, bool IsLocal = true,
                   bool IsExternWeak = false) const;
   bool selectSelect(MachineInstr &MI) const;
+  bool trySelectCZero(GSelect &Sel) const;
   bool selectFPCompare(MachineInstr &MI) const;
   void emitFence(AtomicOrdering FenceOrdering, SyncScope::ID FenceSSID,
                  MachineInstr &MI) const;
@@ -1818,8 +1819,110 @@ bool RISCVInstructionSelector::selectAddr(MachineInstr &MI, bool IsLocal,
   return false;
 }
 
+bool RISCVInstructionSelector::trySelectCZero(GSelect &Sel) const {
+  Register DstReg = Sel.getReg(0);
+
+  // Only scalar GPR selects, and only when czero/vt.maskc is available. The s1
+  // condition is already 0/non-zero, as czero requires (and as the branch
+  // lowering also relies on).
+  if (!STI.hasCZEROLike() ||
+      RBI.getRegBank(DstReg, *MRI, TRI)->getID() != RISCV::GPRBRegBankID)
+    return false;
+
+  Register CondReg = Sel.getCondReg();
+  Register TrueReg = Sel.getTrueReg();
+  Register FalseReg = Sel.getFalseReg();
+
+  auto IsZero = [&](Register R) {
+    auto C = getIConstantVRegValWithLookThrough(R, *MRI);
+    return C && C->Value.isZero();
+  };
+  bool FalseIsZero = IsZero(FalseReg);
+  bool TrueIsZero = IsZero(TrueReg);
+
+  // Don't use the two-sided or(czero, czero) form with the short forward branch
+  // optimization; let the caller emit a branch instead.
+  if (!FalseIsZero && !TrueIsZero && STI.hasConditionalMoveFusion())
+    return false;
+
+  MachineBasicBlock &MBB = *Sel.getParent();
+  const DebugLoc &DL = Sel.getDebugLoc();
+  unsigned EqzOpc = STI.hasStdExtZicond() ? RISCV::CZERO_EQZ : RISCV::VT_MASKC;
+  unsigned NezOpc = STI.hasStdExtZicond() ? RISCV::CZERO_NEZ : RISCV::VT_MASKCN;
+
+  // Fold an eq/ne compare into the condition operand: it is "(A ^ B) == 0", so
+  // test A ^ B (or an operand directly vs zero) and invert eqz/nez for eq.
+  Register Cond = CondReg;
+  bool Invert = false;
+  CmpInst::Predicate Pred;
+  Register CmpLHS, CmpRHS;
+  if (MRI->hasOneNonDBGUse(CondReg) &&
+      mi_match(CondReg, *MRI,
+               m_GICmp(m_Pred(Pred), m_Reg(CmpLHS), m_Reg(CmpRHS))) &&
+      (Pred == CmpInst::ICMP_EQ || Pred == CmpInst::ICMP_NE)) {
+    if (IsZero(CmpRHS)) {
+      Cond = CmpLHS;
+    } else if (IsZero(CmpLHS)) {
+      Cond = CmpRHS;
+    } else {
+      Cond = MRI->createVirtualRegister(&RISCV::GPRRegClass);
+      auto Xor = BuildMI(MBB, Sel, DL, TII.get(RISCV::XOR), Cond)
+                     .addReg(CmpLHS)
+                     .addReg(CmpRHS);
+      constrainSelectedInstRegOperands(*Xor, TII, TRI, RBI);
+    }
+    Invert = Pred == CmpInst::ICMP_EQ;
+  }
+
+  // True passes through when the condition holds, false otherwise; Invert
+  // handles a folded eq compare.
+  unsigned TrueOpc = Invert ? NezOpc : EqzOpc;
+  unsigned FalseOpc = Invert ? EqzOpc : NezOpc;
+
+  // select Cond, T, 0 --> czero.eqz T, Cond
+  if (FalseIsZero) {
+    auto Czero = BuildMI(MBB, Sel, DL, TII.get(TrueOpc), DstReg)
+                     .addReg(TrueReg)
+                     .addReg(Cond);
+    Sel.eraseFromParent();
+    constrainSelectedInstRegOperands(*Czero, TII, TRI, RBI);
+    return true;
+  }
+
+  // select Cond, 0, F --> czero.nez F, Cond
+  if (TrueIsZero) {
+    auto Czero = BuildMI(MBB, Sel, DL, TII.get(FalseOpc), DstReg)
+                     .addReg(FalseReg)
+                     .addReg(Cond);
+    Sel.eraseFromParent();
+    constrainSelectedInstRegOperands(*Czero, TII, TRI, RBI);
+    return true;
+  }
+
+  // select Cond, T, F --> or (czero.eqz T, Cond), (czero.nez F, Cond)
+  Register TrueMasked = MRI->createVirtualRegister(&RISCV::GPRRegClass);
+  Register FalseMasked = MRI->createVirtualRegister(&RISCV::GPRRegClass);
+  auto CzeroT = BuildMI(MBB, Sel, DL, TII.get(TrueOpc), TrueMasked)
+                    .addReg(TrueReg)
+                    .addReg(Cond);
+  auto CzeroF = BuildMI(MBB, Sel, DL, TII.get(FalseOpc), FalseMasked)
+                    .addReg(FalseReg)
+                    .addReg(Cond);
+  auto Or = BuildMI(MBB, Sel, DL, TII.get(RISCV::OR), DstReg)
+                .addReg(TrueMasked)
+                .addReg(FalseMasked);
+  Sel.eraseFromParent();
+  constrainSelectedInstRegOperands(*CzeroT, TII, TRI, RBI);
+  constrainSelectedInstRegOperands(*CzeroF, TII, TRI, RBI);
+  constrainSelectedInstRegOperands(*Or, TII, TRI, RBI);
+  return true;
+}
+
 bool RISCVInstructionSelector::selectSelect(MachineInstr &MI) const {
   auto &SelectMI = cast<GSelect>(MI);
+
+  if (trySelectCZero(SelectMI))
+    return true;
 
   Register LHS, RHS;
   RISCVCC::CondCode CC;
